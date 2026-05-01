@@ -66,17 +66,17 @@ Available folders in this SCM tenant:
 
   1. Global
   2. └── All
-  3.     ├── Cloud-Operations-Provider-01
+  3.     ├── Cloud-Provider-01
   4.     │   ├── COP01-External_01
-  5.     │   │   └── LSY-FW-02
+  5.     │   │   └── CP01-FW-02
   6.     │   └── COP01-Internal_01
-  7.     │       └── LSY-FW
-  8.     │           └── [device] LSY-FW01
-  9.     ├── DCOP01-TIA-External
- 10.     │   └── FW_LAB_TIA_B
+  7.     │       └── CP01-FW-01
+  8.     │           └── [device] CP01-FW01
+  9.     ├── DCOP01-UK-External
+ 10.     │   └── DCOP01-FW01
  11.     │       └── [device] PA-410
- 12.     └── DCOP02-ESH-External
- 13.         └── FW_LAB_ESH
+ 12.     └── DCOP02-DE-External
+ 13.         └── DCOP01-FW02
  14.             └── [device] PA-440
 
 Q. Quit
@@ -101,7 +101,7 @@ dns
 allow
 ```
 ```text
-FW_LAB_TIA_B
+CP01-FW-01
 ```
 ```text
 Outbound_1
@@ -151,7 +151,7 @@ Press:
    ```
 Example output:
 ```text
-Export complete. 7 rule(s) written to 'security_rules_FW_LAB_TIA_B_20260501_143210.csv'.
+Export complete. 7 rule(s) written to 'security_rules_CP01-FW-01_20260501_143210.csv'.
 ```
 Example 2: Filter for DNS rules, then export only those
 Select a folder
@@ -170,7 +170,7 @@ Press:
    ```
 Example output:
 ```text
-Export complete. 2 rule(s) written to 'security_rules_FW_LAB_ESH_20260501_143455.csv'.
+Export complete. 2 rule(s) written to 'security_rules_CP01-FW-02_20260501_143455.csv'.
 ```
 Example 3: Filter by profile name, then export
 Press:
@@ -214,7 +214,7 @@ python -m pip install requests
 2. Script file is `.phy` instead of `.py`
 Rename it:
 ```powershell
-Rename-Item ".\rule-print02.phy" "rule-print02.py"
+Rename-Item ".\rule-print01.phy" "rule-print01.py"
 ```
 3. Folder tree looks flat
 Check these files:

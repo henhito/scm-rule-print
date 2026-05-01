@@ -211,18 +211,13 @@ Install the package:
 ```powershell
 python -m pip install requests
 ```
-2. Script file is `.phy` instead of `.py`
-Rename it:
-```powershell
-Rename-Item ".\rule-print01.phy" "rule-print01.py"
-```
-3. Folder tree looks flat
+2. Folder tree looks flat
 Check these files:
 `scm_folders_list_debug.json`
 `scm_folders_enriched_debug.json`
 `scm_devices_debug.json`
 That usually means the SCM API payload is not exposing the parent-child relationship in the field the script expects.
-4. Some exported columns are blank
+3. Some exported columns are blank
 Columns like these may be empty if the SCM API response does not return them directly for that rule:
 Profile
 Options

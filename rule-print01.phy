@@ -1,0 +1,994 @@
+import csv
+import json
+import os
+import re
+import sys
+import time
+import textwrap
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+import requests
+
+CONFIG_FILE = "secrets.json"
+
+SCM_AUTH_URL = "https://auth.apps.paloaltonetworks.com/oauth2/access_token"
+SCM_API_BASE = "https://api.strata.paloaltonetworks.com"
+FOLDERS_ENDPOINT = f"{SCM_API_BASE}/config/setup/v1/folders"
+DEVICES_ENDPOINT = f"{SCM_API_BASE}/config/setup/v1/devices"
+SECURITY_RULES_ENDPOINT = f"{SCM_API_BASE}/config/security/v1/security-rules"
+
+token_cache: Dict[str, Any] = {"access_token": None, "expires_at": 0}
+
+VALID_ACTIONS = {
+    "allow",
+    "deny",
+    "drop",
+    "reset-client",
+    "reset-server",
+    "reset-both",
+}
+
+CSV_COLUMNS = [
+    "Name",
+    "Tags",
+    "Source Zone",
+    "Source Address",
+    "Source User",
+    "Source Device",
+    "Destination Zone",
+    "Destination Address",
+    "Application",
+    "Service",
+    "URL Category",
+    "Action",
+    "Profile",
+    "Options",
+    "Target",
+    "Rule Usage",
+    "Rule Usage Apps Seen",
+    "Modified",
+    "Created",
+]
+
+TABLE_COLUMNS = [
+    ("No", 4),
+    ("Name", 32),
+    ("Action", 10),
+    ("Source Zone", 16),
+    ("Destination Zone", 16),
+    ("App / Service", 28),
+]
+
+
+def load_config(config_file: str = CONFIG_FILE) -> Dict[str, str]:
+    if not os.path.exists(config_file):
+        print(f"Error: Configuration file '{config_file}' not found.")
+        print("Create it in the same folder as this script.")
+        print("It must include SCM_CLIENT_ID, SCM_CLIENT_SECRET, and SCM_TSG_ID.")
+        sys.exit(1)
+
+    with open(config_file, "r", encoding="utf-8") as f:
+        secrets = json.load(f)
+
+    required_keys = ["SCM_CLIENT_ID", "SCM_CLIENT_SECRET", "SCM_TSG_ID"]
+    missing = [key for key in required_keys if not secrets.get(key)]
+    if missing:
+        print(f"Error: Missing required keys in '{config_file}': {', '.join(missing)}")
+        sys.exit(1)
+
+    return secrets
+
+
+def get_access_token(secrets: Dict[str, str], force_refresh: bool = False) -> Optional[str]:
+    global token_cache
+
+    if (
+        not force_refresh
+        and token_cache["access_token"]
+        and time.time() < token_cache["expires_at"] - 60
+    ):
+        return token_cache["access_token"]
+
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+    }
+    payload = {
+        "grant_type": "client_credentials",
+        "scope": f"tsg_id:{secrets['SCM_TSG_ID']}",
+    }
+
+    try:
+        response = requests.post(
+            SCM_AUTH_URL,
+            headers=headers,
+            data=payload,
+            auth=(secrets["SCM_CLIENT_ID"], secrets["SCM_CLIENT_SECRET"]),
+            timeout=30,
+        )
+        response.raise_for_status()
+
+        token_data = response.json()
+        access_token = token_data.get("access_token")
+        expires_in = int(token_data.get("expires_in", 900))
+
+        if not access_token:
+            print("Error: SCM token response did not include an access_token.")
+            return None
+
+        token_cache["access_token"] = access_token
+        token_cache["expires_at"] = time.time() + expires_in
+        return access_token
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error obtaining SCM token: {e}")
+        if getattr(e, "response", None) is not None:
+            print(f"Status: {e.response.status_code}")
+            print(f"Body: {e.response.text}")
+        return None
+
+
+def api_get(
+    url: str,
+    token: str,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: int = 30,
+) -> requests.Response:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    return requests.get(url, headers=headers, params=params, timeout=timeout)
+
+
+def get_all_items(
+    url: str,
+    secrets: Dict[str, str],
+    extra_params: Optional[Dict[str, Any]] = None,
+    page_size: int = 200,
+) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    offset = 0
+    token = get_access_token(secrets)
+
+    if not token:
+        return []
+
+    while True:
+        params = {"limit": page_size, "offset": offset}
+        if extra_params:
+            params.update(extra_params)
+
+        try:
+            response = api_get(url, token, params=params)
+
+            if response.status_code == 401:
+                token = get_access_token(secrets, force_refresh=True)
+                if not token:
+                    print("Token refresh failed.")
+                    return items
+                response = api_get(url, token, params=params)
+
+            response.raise_for_status()
+
+            payload = response.json()
+            batch = payload.get("data", [])
+
+            if isinstance(batch, dict):
+                batch = [batch]
+
+            if not isinstance(batch, list):
+                print("Unexpected API response format.")
+                print(response.text)
+                return items
+
+            items.extend(batch)
+
+            if len(batch) < page_size:
+                break
+
+            offset += page_size
+
+        except requests.exceptions.RequestException as e:
+            print(f"API request failed for {url}: {e}")
+            if getattr(e, "response", None) is not None:
+                print(f"Status: {e.response.status_code}")
+                print(f"Body: {e.response.text}")
+            break
+
+    return items
+
+
+def get_item_by_id(
+    base_url: str,
+    item_id: str,
+    secrets: Dict[str, str],
+) -> Optional[Dict[str, Any]]:
+    token = get_access_token(secrets)
+    if not token:
+        return None
+
+    url = f"{base_url}/{item_id}"
+
+    try:
+        response = api_get(url, token, params=None)
+
+        if response.status_code == 401:
+            token = get_access_token(secrets, force_refresh=True)
+            if not token:
+                return None
+            response = api_get(url, token, params=None)
+
+        response.raise_for_status()
+        payload = response.json()
+
+        if isinstance(payload, dict) and "data" in payload and isinstance(payload["data"], dict):
+            return payload["data"]
+
+        if isinstance(payload, dict):
+            return payload
+
+        return None
+
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to retrieve item by id '{item_id}': {e}")
+        if getattr(e, "response", None) is not None:
+            print(f"Status: {e.response.status_code}")
+            print(f"Body: {e.response.text}")
+        return None
+
+
+def enrich_folders_with_details(
+    folders: List[Dict[str, Any]],
+    secrets: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    enriched: List[Dict[str, Any]] = []
+
+    for folder in folders:
+        folder_id = folder.get("id")
+        if not folder_id:
+            enriched.append(folder)
+            continue
+
+        detail = get_item_by_id(FOLDERS_ENDPOINT, str(folder_id), secrets)
+        if detail and isinstance(detail, dict):
+            # Keep any missing list fields from the original as a fallback
+            merged = dict(folder)
+            merged.update(detail)
+            enriched.append(merged)
+        else:
+            enriched.append(folder)
+
+    return enriched
+
+
+def stringify(value: Any) -> str:
+    if value is None:
+        return ""
+
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, dict):
+                parts.append(
+                    item.get("name")
+                    or item.get("display_name")
+                    or item.get("value")
+                    or item.get("member")
+                    or item.get("id")
+                    or json.dumps(item, ensure_ascii=False)
+                )
+            else:
+                parts.append(str(item))
+        return ", ".join([part for part in parts if part])
+
+    if isinstance(value, dict):
+        return (
+            value.get("name")
+            or value.get("display_name")
+            or value.get("value")
+            or value.get("member")
+            or value.get("id")
+            or json.dumps(value, ensure_ascii=False)
+        )
+
+    return str(value)
+
+
+def first_present(item: Dict[str, Any], keys: List[str], default: Any = "") -> Any:
+    for key in keys:
+        value = item.get(key)
+        if value not in (None, "", [], {}):
+            return value
+    return default
+
+
+def safe_filename(value: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*]+', "_", value).strip()
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    return cleaned or "folder"
+
+
+def build_profile(rule: Dict[str, Any]) -> str:
+    profile_value = first_present(
+        rule,
+        [
+            "profile_setting",
+            "profile_settings",
+            "profile",
+            "profiles",
+            "group_profile",
+            "profile_group",
+        ],
+        "",
+    )
+
+    if isinstance(profile_value, dict):
+        if "group" in profile_value:
+            group_value = profile_value["group"]
+            if isinstance(group_value, list):
+                return ", ".join(str(v) for v in group_value if v)
+            return str(group_value)
+
+        if "profiles" in profile_value:
+            profiles_value = profile_value["profiles"]
+            if isinstance(profiles_value, list):
+                return ", ".join(str(v) for v in profiles_value if v)
+            return str(profiles_value)
+
+    return stringify(profile_value)
+
+
+def build_options(rule: Dict[str, Any]) -> str:
+    parts = []
+
+    direct_option = first_present(rule, ["options", "option"], "")
+    if direct_option:
+        direct_text = stringify(direct_option)
+        if direct_text:
+            parts.append(direct_text)
+
+    flags = [
+        ("disabled", "disabled"),
+        ("negate_source", "negate-source"),
+        ("negate_destination", "negate-destination"),
+        ("log_start", "log-start"),
+        ("log_end", "log-end"),
+    ]
+
+    for key, label in flags:
+        if rule.get(key) is True:
+            parts.append(label)
+
+    return ", ".join(parts)
+
+
+def build_target(rule: Dict[str, Any]) -> str:
+    return stringify(
+        first_present(
+            rule,
+            ["target", "targets", "target_devices", "target_device"],
+            "",
+        )
+    )
+
+
+def build_rule_usage(rule: Dict[str, Any]) -> str:
+    return stringify(
+        first_present(
+            rule,
+            ["rule_usage", "usage", "hit_count", "usage_count"],
+            "",
+        )
+    )
+
+
+def build_rule_usage_apps_seen(rule: Dict[str, Any]) -> str:
+    return stringify(
+        first_present(
+            rule,
+            ["rule_usage_apps_seen", "apps_seen", "applications_seen"],
+            "",
+        )
+    )
+
+
+def build_modified(rule: Dict[str, Any]) -> str:
+    return stringify(
+        first_present(
+            rule,
+            ["modified_at", "updated_at", "last_modified"],
+            "",
+        )
+    )
+
+
+def build_created(rule: Dict[str, Any]) -> str:
+    return stringify(
+        first_present(
+            rule,
+            ["created_at", "created"],
+            "",
+        )
+    )
+
+
+def build_rule_record(rule: Dict[str, Any]) -> Dict[str, str]:
+    return {
+        "Name": stringify(first_present(rule, ["name"])),
+        "Tags": stringify(first_present(rule, ["tag", "tags"])),
+        "Source Zone": stringify(first_present(rule, ["from", "source_zone", "source_zones"])),
+        "Source Address": stringify(first_present(rule, ["source", "source_address", "source_addresses"])),
+        "Source User": stringify(first_present(rule, ["source_user", "user", "users"])),
+        "Source Device": stringify(first_present(rule, ["source_device", "device", "devices"])),
+        "Destination Zone": stringify(first_present(rule, ["to", "destination_zone", "destination_zones"])),
+        "Destination Address": stringify(first_present(rule, ["destination", "destination_address", "destination_addresses"])),
+        "Application": stringify(first_present(rule, ["application", "applications"])),
+        "Service": stringify(first_present(rule, ["service"])),
+        "URL Category": stringify(first_present(rule, ["category", "url_category", "url_categories"])),
+        "Action": stringify(first_present(rule, ["action"])),
+        "Profile": build_profile(rule),
+        "Options": build_options(rule),
+        "Target": build_target(rule),
+        "Rule Usage": build_rule_usage(rule),
+        "Rule Usage Apps Seen": build_rule_usage_apps_seen(rule),
+        "Modified": build_modified(rule),
+        "Created": build_created(rule),
+    }
+
+
+def is_valid_rule(rule: Dict[str, Any]) -> bool:
+    name = stringify(first_present(rule, ["name"])).strip()
+    action = stringify(first_present(rule, ["action"])).strip().lower()
+    return bool(name) and action in VALID_ACTIONS
+
+
+def prepare_rule_records(raw_rules: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    valid_rules = [rule for rule in raw_rules if is_valid_rule(rule)]
+    return [build_rule_record(rule) for rule in valid_rules]
+
+
+def export_rules_to_csv(folder_name: str, records: List[Dict[str, str]]) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"security_rules_{safe_filename(folder_name)}_{timestamp}.csv"
+
+    with open(filename, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+        for record in records:
+            writer.writerow(record)
+
+    return filename
+
+
+def folder_display_name(folder: Dict[str, Any]) -> str:
+    for key in ("name", "display_name", "folder", "folder_name"):
+        value = folder.get(key)
+        if value not in (None, "", [], {}):
+            return str(value)
+    return ""
+
+
+def should_show_folder(folder: Dict[str, Any]) -> bool:
+    name = folder_display_name(folder).strip()
+    if not name:
+        return False
+    if name.isdigit():
+        return False
+    return True
+
+
+def folder_key(folder: Dict[str, Any]) -> str:
+    for key in ("id", "name", "display_name", "folder", "folder_id"):
+        value = folder.get(key)
+        if value not in (None, "", [], {}):
+            return str(value)
+    return ""
+
+
+def folder_parent_key(folder: Dict[str, Any]) -> str:
+    parent = folder.get("parent")
+
+    if isinstance(parent, dict):
+        for subkey in ("id", "name", "display_name", "folder"):
+            subvalue = parent.get(subkey)
+            if subvalue not in (None, "", [], {}):
+                return str(subvalue)
+
+    if parent not in (None, "", [], {}):
+        return str(parent)
+
+    for key in (
+        "parent_id",
+        "parentId",
+        "parent_folder",
+        "parent_folder_id",
+        "container",
+        "container_id",
+        "ancestor",
+        "ancestor_id",
+    ):
+        value = folder.get(key)
+        if isinstance(value, dict):
+            for subkey in ("id", "name", "display_name", "folder"):
+                subvalue = value.get(subkey)
+                if subvalue not in (None, "", [], {}):
+                    return str(subvalue)
+        elif value not in (None, "", [], {}):
+            return str(value)
+
+    return ""
+
+
+def folder_sort_name(folder: Dict[str, Any]) -> str:
+    return folder_display_name(folder).strip().lower()
+
+
+def device_display_name(device: Dict[str, Any]) -> str:
+    for key in ("display_name", "name", "hostname", "serial_number", "id"):
+        value = device.get(key)
+        if value not in (None, "", [], {}):
+            return str(value)
+    return "Unknown Device"
+
+
+def device_folder_ref(device: Dict[str, Any]) -> str:
+    candidates = [
+        "folder",
+        "folder_name",
+        "parent",
+        "parent_id",
+        "parent_folder",
+        "container",
+        "container_id",
+        "snippet_folder",
+        "snippet_folder_id",
+        "device_group",
+    ]
+
+    for key in candidates:
+        value = device.get(key)
+        if isinstance(value, dict):
+            for subkey in ("id", "name", "display_name", "folder"):
+                subvalue = value.get(subkey)
+                if subvalue not in (None, "", [], {}):
+                    return str(subvalue)
+        elif value not in (None, "", [], {}):
+            return str(value)
+
+    return ""
+
+
+def build_folder_nodes(folders: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    nodes: Dict[str, Dict[str, Any]] = {}
+
+    for folder in folders:
+        key = folder_key(folder)
+        name = folder_display_name(folder)
+        if not key or not name:
+            continue
+
+        nodes[key] = {
+            "id": key,
+            "name": name,
+            "kind": "folder",
+            "source": folder,
+            "children": [],
+            "parent_id": None,
+        }
+
+    # First pass: direct parent match by key
+    for folder in folders:
+        node_id = folder_key(folder)
+        parent_ref = folder_parent_key(folder)
+
+        if node_id in nodes and parent_ref and parent_ref in nodes:
+            nodes[node_id]["parent_id"] = parent_ref
+
+    # Second pass: parent might be a folder name rather than ID
+    name_to_id = {node["name"]: node_id for node_id, node in nodes.items()}
+    for folder in folders:
+        node_id = folder_key(folder)
+        if node_id not in nodes or nodes[node_id]["parent_id"] is not None:
+            continue
+
+        parent_ref = folder_parent_key(folder)
+        if parent_ref and parent_ref in name_to_id:
+            nodes[node_id]["parent_id"] = name_to_id[parent_ref]
+
+    # Best-effort special anchoring for common roots
+    global_id = name_to_id.get("Global")
+    all_id = name_to_id.get("All") or name_to_id.get("All Firewalls")
+
+    if global_id and all_id and nodes[all_id]["parent_id"] is None and all_id != global_id:
+        nodes[all_id]["parent_id"] = global_id
+
+    return nodes
+
+
+def attach_devices_to_folders(
+    nodes: Dict[str, Dict[str, Any]],
+    devices: List[Dict[str, Any]],
+) -> None:
+    name_to_id = {node["name"]: node_id for node_id, node in nodes.items()}
+    id_set = set(nodes.keys())
+
+    for idx, device in enumerate(devices, start=1):
+        device_name = device_display_name(device)
+        folder_ref = device_folder_ref(device).strip()
+
+        parent_id = None
+        if folder_ref in id_set:
+            parent_id = folder_ref
+        elif folder_ref in name_to_id:
+            parent_id = name_to_id[folder_ref]
+
+        if not parent_id:
+            continue
+
+        node_id = f"device::{idx}::{device_name}"
+        nodes[node_id] = {
+            "id": node_id,
+            "name": device_name,
+            "kind": "device",
+            "source": device,
+            "children": [],
+            "parent_id": parent_id,
+        }
+
+
+def root_sort_key(node: Dict[str, Any]) -> tuple:
+    name = node["name"].strip().lower()
+
+    if name == "global":
+        return (0, name)
+    if name in ("all", "all firewalls", "prisma access"):
+        return (1, name)
+
+    return (2, name)
+
+
+def link_children(nodes: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    for node in nodes.values():
+        node["children"] = []
+
+    roots: List[Dict[str, Any]] = []
+
+    for node in nodes.values():
+        parent_id = node.get("parent_id")
+        if parent_id and parent_id in nodes and parent_id != node["id"]:
+            nodes[parent_id]["children"].append(node)
+        else:
+            roots.append(node)
+
+    def sort_key(node: Dict[str, Any]) -> tuple:
+        name = node["name"].strip().lower()
+        if node["kind"] == "folder":
+            return (0, name)
+        return (1, name)
+
+    def sort_recursive(node: Dict[str, Any]) -> None:
+        node["children"].sort(key=sort_key)
+        for child in node["children"]:
+            sort_recursive(child)
+
+    roots.sort(key=root_sort_key)
+    for root in roots:
+        sort_recursive(root)
+
+    return roots
+
+
+def flatten_tree(roots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    flattened: List[Dict[str, Any]] = []
+
+    def walk(node: Dict[str, Any], depth: int, prefix_parts: List[bool], is_last: bool) -> None:
+        flattened.append(
+            {
+                "node": node,
+                "depth": depth,
+                "prefix_parts": prefix_parts[:],
+                "is_last": is_last,
+            }
+        )
+
+        children = node.get("children", [])
+        for idx, child in enumerate(children):
+            child_is_last = idx == len(children) - 1
+            walk(child, depth + 1, prefix_parts + [not is_last], child_is_last)
+
+    for idx, root in enumerate(roots):
+        root_is_last = idx == len(roots) - 1
+        walk(root, 0, [], root_is_last)
+
+    return flattened
+
+
+def build_combined_tree(
+    folders: List[Dict[str, Any]],
+    devices: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    usable_folders = [folder for folder in folders if should_show_folder(folder)]
+    nodes = build_folder_nodes(usable_folders)
+    attach_devices_to_folders(nodes, devices)
+    roots = link_children(nodes)
+    return flatten_tree(roots)
+
+
+def format_tree_prefix(prefix_parts: List[bool], is_last: bool, depth: int) -> str:
+    if depth == 0:
+        return ""
+
+    pieces = []
+    for has_more_siblings in prefix_parts[:-1]:
+        pieces.append("│   " if has_more_siblings else "    ")
+    pieces.append("└── " if is_last else "├── ")
+    return "".join(pieces)
+
+
+def print_scope_menu(display_items: List[Dict[str, Any]]) -> None:
+    print("\nAvailable folders in this SCM tenant:\n")
+
+    for index, item in enumerate(display_items, start=1):
+        node = item["node"]
+        depth = item["depth"]
+        prefix_parts = item["prefix_parts"]
+        is_last = item["is_last"]
+
+        tree_prefix = format_tree_prefix(prefix_parts, is_last, depth)
+        label = node["name"]
+        if node["kind"] == "device":
+            label = f"[device] {label}"
+
+        print(f"{index:>3}. {tree_prefix}{label}")
+
+    print("\nQ. Quit")
+
+
+def truncate_cell(value: str, width: int) -> str:
+    text = (value or "").replace("\n", " ").strip()
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    return text[: width - 3] + "..."
+
+
+def horizontal_line(columns: List[tuple]) -> str:
+    return "+" + "+".join("-" * (width + 2) for _, width in columns) + "+"
+
+
+def print_rules_table(records: List[Dict[str, str]], scope_name: str, filter_term: str = "") -> None:
+    print("\n" + "=" * 120)
+    print(f"Scope: {scope_name}")
+    print(f"Valid rules found: {len(records)}")
+    if filter_term:
+        print(f"Filter: {filter_term}")
+    print("=" * 120)
+
+    if not records:
+        print("No matching valid rules found.")
+        return
+
+    hline = horizontal_line(TABLE_COLUMNS)
+    print(hline)
+    print("| " + " | ".join(title.ljust(width) for title, width in TABLE_COLUMNS) + " |")
+    print(hline)
+
+    full_width = sum(width for _, width in TABLE_COLUMNS) + (3 * (len(TABLE_COLUMNS) - 1))
+
+    for index, record in enumerate(records, start=1):
+        app_value = record.get("Application", "") or "any"
+        service_value = record.get("Service", "") or "any"
+
+        display_row = {
+            "No": str(index),
+            "Name": record.get("Name", ""),
+            "Action": record.get("Action", ""),
+            "Source Zone": record.get("Source Zone", "") or "any",
+            "Destination Zone": record.get("Destination Zone", "") or "any",
+            "App / Service": f"{app_value} / {service_value}",
+        }
+
+        row_text = []
+        for key, width in TABLE_COLUMNS:
+            row_text.append(truncate_cell(display_row.get(key, ""), width).ljust(width))
+
+        print("| " + " | ".join(row_text) + " |")
+
+        detail_text = (
+            f"Src Addr: {record.get('Source Address', '') or 'any'} | "
+            f"Dst Addr: {record.get('Destination Address', '') or 'any'} | "
+            f"User: {record.get('Source User', '') or 'any'} | "
+            f"Device: {record.get('Source Device', '') or 'any'} | "
+            f"URL Cat: {record.get('URL Category', '') or 'any'}"
+        )
+
+        detail_lines = textwrap.wrap(
+            detail_text,
+            width=full_width,
+            break_long_words=False,
+            break_on_hyphens=False,
+        ) or [""]
+
+        for line in detail_lines:
+            print(f"| {line.ljust(full_width)} |")
+
+        print(hline)
+
+
+def record_matches_search(record: Dict[str, str], search_term: str) -> bool:
+    needle = search_term.strip().lower()
+    if not needle:
+        return True
+
+    for value in record.values():
+        if needle in str(value).lower():
+            return True
+
+    return False
+
+
+def filter_records(records: List[Dict[str, str]], search_term: str) -> List[Dict[str, str]]:
+    needle = search_term.strip()
+    if not needle:
+        return records[:]
+    return [record for record in records if record_matches_search(record, needle)]
+
+
+def get_scope_name_for_rules(node: Dict[str, Any]) -> Optional[str]:
+    if node["kind"] == "folder":
+        return node["name"]
+
+    source = node.get("source", {})
+    for key in ("folder", "folder_name", "parent_folder", "container"):
+        value = source.get(key)
+        if isinstance(value, dict):
+            for subkey in ("name", "display_name", "folder", "id"):
+                subvalue = value.get(subkey)
+                if subvalue not in (None, "", [], {}):
+                    return str(subvalue)
+        elif value not in (None, "", [], {}):
+            return str(value)
+
+    parent_id = node.get("parent_id")
+    if parent_id:
+        return None
+
+    return None
+
+
+def scope_selection_loop(secrets: Dict[str, str]) -> None:
+    print("Retrieving folders...")
+    folders = get_all_items(FOLDERS_ENDPOINT, secrets)
+
+    with open("scm_folders_list_debug.json", "w", encoding="utf-8") as f:
+        json.dump(folders, f, indent=2, ensure_ascii=False)
+
+    print("Retrieving full folder details...")
+    folders = enrich_folders_with_details(folders, secrets)
+
+    with open("scm_folders_enriched_debug.json", "w", encoding="utf-8") as f:
+        json.dump(folders, f, indent=2, ensure_ascii=False)
+
+    print("Retrieving devices...")
+    devices = get_all_items(DEVICES_ENDPOINT, secrets)
+
+    with open("scm_devices_debug.json", "w", encoding="utf-8") as f:
+        json.dump(devices, f, indent=2, ensure_ascii=False)
+
+    display_items = build_combined_tree(folders, devices)
+
+    if not display_items:
+        print("No usable folders or devices were returned by the tenant.")
+        return
+
+    while True:
+        print_scope_menu(display_items)
+        selection = input("\nEnter number: ").strip()
+
+        if selection.lower() == "q":
+            print("Exiting.")
+            return
+
+        if not selection.isdigit():
+            print("Please enter a valid number.")
+            continue
+
+        selection_num = int(selection)
+        if selection_num < 1 or selection_num > len(display_items):
+            print(f"Please enter a number between 1 and {len(display_items)}.")
+            continue
+
+        selected_node = display_items[selection_num - 1]["node"]
+        scope_name = get_scope_name_for_rules(selected_node)
+
+        # If the selected item is a device, fall back to its parent folder node in the menu tree
+        if not scope_name and selected_node["kind"] == "device":
+            parent_name = None
+            source = selected_node.get("source", {})
+            parent_ref = device_folder_ref(source)
+            if parent_ref:
+                for item in display_items:
+                    node = item["node"]
+                    if node["kind"] != "folder":
+                        continue
+                    if node["id"] == parent_ref or node["name"] == parent_ref:
+                        parent_name = node["name"]
+                        break
+            scope_name = parent_name
+
+        if not scope_name:
+            print("Could not determine the folder scope for this item.")
+            continue
+
+        print(f"\nRetrieving security rules from scope: {scope_name}")
+        raw_rules = get_all_items(
+            SECURITY_RULES_ENDPOINT,
+            secrets,
+            extra_params={"folder": scope_name},
+        )
+
+        all_records = prepare_rule_records(raw_rules)
+        current_filter = ""
+        displayed_records = all_records[:]
+
+        print_rules_table(displayed_records, scope_name, current_filter)
+
+        while True:
+            print("\nOptions:")
+            print("E. Export displayed rules to CSV")
+            print("F. Filter rules")
+            print("R. Return to main menu")
+            print("Q. Quit")
+
+            action = input("\nChoose an option: ").strip().lower()
+
+            if action == "e":
+                if not displayed_records:
+                    print("There are no displayed rules to export.")
+                    continue
+
+                output_file = export_rules_to_csv(scope_name, displayed_records)
+                print(f"Export complete. {len(displayed_records)} rule(s) written to '{output_file}'.")
+
+            elif action == "f":
+                search_term = input(
+                    "\nEnter search term for filtering "
+                    "(leave blank to clear filter and show all rules): "
+                ).strip()
+
+                current_filter = search_term
+                displayed_records = filter_records(all_records, current_filter)
+                print_rules_table(displayed_records, scope_name, current_filter)
+
+            elif action == "r":
+                break
+
+            elif action == "q":
+                print("Exiting.")
+                return
+
+            else:
+                print("Invalid option. Please enter E, F, R, or Q.")
+
+
+def main() -> None:
+    print("SCM Scope and Rule Browser")
+    print("--------------------------")
+
+    secrets = load_config()
+
+    print("Authenticating to SCM...")
+    token = get_access_token(secrets)
+    if not token:
+        print("Authentication failed.")
+        sys.exit(1)
+
+    scope_selection_loop(secrets)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,17 +1,14 @@
 SCM Rule Browser Script
-This script connects to Palo Alto Networks Strata Cloud Manager (SCM), lets a user browse the available folder / device scope tree, view security rules, filter rules, and export the currently displayed rules to CSV.
+
+This Python script connects to Palo Alto Networks Strata Cloud Manager (SCM) and helps you browse firewall rules across folders and devices, filter them, and export the results to CSV. It automates the process of retrieving the SCM scope tree (folders and devices), displaying security rules, filtering them by keywords, and exporting selected rules to a CSV file with the same columns as displayed in the SCM UI.
+
 What the script does
-Authenticates to SCM using OAuth client credentials
-Retrieves:
-folders
-folder details
-devices
-security rules
-Displays the available scope tree in the console
-Lets the user:
-select a folder or device scope
-filter the displayed rules by a search term
-export the displayed rules to CSV
+Authenticate using an OAuth client (SCM_CLIENT_ID / SCM_CLIENT_SECRET) with your tenant scope (SCM_TSG_ID).
+Retrieve folders and devices from your tenant and display them as a tree so you can choose a scope.
+List security rules within the selected folder or device, showing key columns such as name, tags, source, destination, application, service, category, action, profile, options, target, usage, and modified/created timestamps.
+Filter rules by any term across all fields. For example, you can search for a device name, a user, an address, a tag, an application (e.g. dns), or a rule action (allow).
+Export rules to a CSV file containing exactly the columns you see in SCM.
+
 Requirements
 Python 3.10 or later recommended
 Internet access to the SCM API

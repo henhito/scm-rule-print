@@ -5,7 +5,7 @@ This Python script connects to Palo Alto Networks Strata Cloud Manager (SCM) and
 What the script does
 Authenticate using an OAuth client (SCM_CLIENT_ID / SCM_CLIENT_SECRET) with your tenant scope (SCM_TSG_ID).
 Retrieve folders and devices from your tenant and display them as a tree so you can choose a scope.
-List security rules within the selected folder or device, showing key columns such as name, tags, source, destination, application, service, category, action, profile, options, target, usage, and modified/created timestamps.
+List security rules within the selected folder or device, showing key columns such as name, tags, source, destination, application, service, category, action, profile, options, target, usage, hit count, first/last hit, and modified/created timestamps when supplied by SCM.
 Filter rules by any term across all fields. For example, you can search for a device name, a user, an address, a tag, an application (e.g. dns), or a rule action (allow).
 Export rules to a CSV file containing exactly the columns you see in SCM.
 
@@ -133,8 +133,11 @@ Options
 Target
 Rule Usage
 Rule Usage Apps Seen
-Modified
-Created
+Hit Count
+First Hit
+Last Hit
+Last Modified
+First Created
 CSV export examples
 Example 1: Export all rules in a folder
 Select the folder:
@@ -231,3 +234,12 @@ Notes
 The script exports only valid rules with a real action
 The script does not permanently store CSVs outside the folder where it is run
 CSV files are named automatically with the scope name and timestamp
+
+Rule hit count and audit timestamp availability
+-----------------------------------------------
+The terminal table now displays Hit Count and Last Hit. The detail line shows First Hit, Last Modified, and First Created. CSV contains all five fields.
+Values are extracted only when present in the SCM security rule API response, including supported nested metadata. Missing values are shown as N/A in the terminal and left blank in the CSV. An explicit hit count of 0 remains 0. Unix seconds and milliseconds are normalized to UTC ISO 8601 timestamps.
+
+Important: SCM's documented /config/security/v1/security-rules response does not guarantee hit count or original rule audit timestamps. This change does not calculate hit counts from logs or query a separate telemetry service. PAN-OS/Panorama operational rule-hit-count APIs are different from the SCM configuration API. Do not interpret blank as zero hits or as proof the rule has never been used.
+
+Security note: do not commit a real secrets.json to a public repository; use a local untracked credentials file, and rotate any credentials previously exposed.

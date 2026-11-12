@@ -5,7 +5,7 @@ import re
 import sys
 import time
 import textwrap
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -47,8 +47,11 @@ CSV_COLUMNS = [
     "Target",
     "Rule Usage",
     "Rule Usage Apps Seen",
-    "Modified",
-    "Created",
+    "Hit Count",
+    "First Hit",
+    "Last Hit",
+    "Last Modified",
+    "First Created",
 ]
 
 TABLE_COLUMNS = [
@@ -58,6 +61,8 @@ TABLE_COLUMNS = [
     ("Source Zone", 16),
     ("Destination Zone", 16),
     ("App / Service", 28),
+    ("Hit Count", 12),
+    ("Last Hit", 20),
 ]
 
 
@@ -395,24 +400,68 @@ def build_rule_usage_apps_seen(rule: Dict[str, Any]) -> str:
     )
 
 
+def rule_metadata_value(rule: Dict[str, Any], keys: List[str]) -> Any:
+    """Read supplied SCM metadata, without mistaking missing data for zero."""
+    for source in (rule, rule.get("metadata"), rule.get("rule_usage"),
+                   rule.get("usage"), rule.get("audit")):
+        if not isinstance(source, dict):
+            continue
+        for key in keys:
+            value = source.get(key)
+            if value is not None and value != "" and value != [] and value != {}:
+                return value
+    return ""
+
+
+def format_rule_timestamp(value: Any) -> str:
+    """Convert Unix seconds/milliseconds to UTC; retain ISO date strings."""
+    if value in (None, "", 0, "0"):
+        return ""
+    if isinstance(value, dict):
+        value = first_present(value, ["timestamp", "value", "date"], "")
+    if isinstance(value, (int, float)) or (
+        isinstance(value, str) and value.strip().isdigit()
+    ):
+        try:
+            ts = float(value)
+            if ts > 1e12:
+                ts /= 1000
+            return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except (ValueError, OverflowError, OSError):
+            pass
+    return stringify(value)
+
+
+def build_hit_count(rule: Dict[str, Any]) -> str:
+    return stringify(rule_metadata_value(rule, [
+        "hit_count", "hit-count", "rule_hit_count", "usage_count",
+    ]))
+
+
+def build_first_hit(rule: Dict[str, Any]) -> str:
+    return format_rule_timestamp(rule_metadata_value(rule, [
+        "first_hit_timestamp", "first-hit-timestamp", "first_hit", "first_hit_at",
+    ]))
+
+
+def build_last_hit(rule: Dict[str, Any]) -> str:
+    return format_rule_timestamp(rule_metadata_value(rule, [
+        "last_hit_timestamp", "last-hit-timestamp", "last_hit", "last_hit_at",
+    ]))
+
+
 def build_modified(rule: Dict[str, Any]) -> str:
-    return stringify(
-        first_present(
-            rule,
-            ["modified_at", "updated_at", "last_modified"],
-            "",
-        )
-    )
+    return format_rule_timestamp(rule_metadata_value(rule, [
+        "rule_modification_timestamp", "rule-modification-timestamp",
+        "modified_at", "updated_at", "last_modified", "modified",
+    ]))
 
 
 def build_created(rule: Dict[str, Any]) -> str:
-    return stringify(
-        first_present(
-            rule,
-            ["created_at", "created"],
-            "",
-        )
-    )
+    return format_rule_timestamp(rule_metadata_value(rule, [
+        "rule_creation_timestamp", "rule-creation-timestamp",
+        "created_at", "created", "creation_time",
+    ]))
 
 
 def build_rule_record(rule: Dict[str, Any]) -> Dict[str, str]:
@@ -434,8 +483,11 @@ def build_rule_record(rule: Dict[str, Any]) -> Dict[str, str]:
         "Target": build_target(rule),
         "Rule Usage": build_rule_usage(rule),
         "Rule Usage Apps Seen": build_rule_usage_apps_seen(rule),
-        "Modified": build_modified(rule),
-        "Created": build_created(rule),
+        "Hit Count": build_hit_count(rule),
+        "First Hit": build_first_hit(rule),
+        "Last Hit": build_last_hit(rule),
+        "Last Modified": build_modified(rule),
+        "First Created": build_created(rule),
     }
 
 
@@ -790,6 +842,8 @@ def print_rules_table(records: List[Dict[str, str]], scope_name: str, filter_ter
             "Source Zone": record.get("Source Zone", "") or "any",
             "Destination Zone": record.get("Destination Zone", "") or "any",
             "App / Service": f"{app_value} / {service_value}",
+            "Hit Count": record.get("Hit Count", "") or "N/A",
+            "Last Hit": record.get("Last Hit", "") or "N/A",
         }
 
         row_text = []
@@ -803,7 +857,10 @@ def print_rules_table(records: List[Dict[str, str]], scope_name: str, filter_ter
             f"Dst Addr: {record.get('Destination Address', '') or 'any'} | "
             f"User: {record.get('Source User', '') or 'any'} | "
             f"Device: {record.get('Source Device', '') or 'any'} | "
-            f"URL Cat: {record.get('URL Category', '') or 'any'}"
+            f"URL Cat: {record.get('URL Category', '') or 'any'} | "
+            f"First Hit: {record.get('First Hit', '') or 'N/A'} | "
+            f"Last Modified: {record.get('Last Modified', '') or 'N/A'} | "
+            f"First Created: {record.get('First Created', '') or 'N/A'}"
         )
 
         detail_lines = textwrap.wrap(
